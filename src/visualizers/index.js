@@ -159,7 +159,7 @@ const drawPulse = (ctx, frame, settings, dimensions) => {
 const drawSpectrogram = (ctx, frame, settings, dimensions, state) => {
   const { width, height } = dimensions;
   const columns = state.spectrogramColumns;
-  const columnWidth = Math.max(1, Math.ceil(width / columns.length));
+  const columnWidth = 4;
   const nextColumn = new Uint8Array(96);
 
   for (let index = 0; index < nextColumn.length; index += 1) {
@@ -211,6 +211,10 @@ export const VISUALIZER_MODES = {
 export const createVisualizerState = () => ({
   spectrogramColumns: [],
 });
+
+export const resetVisualizerState = (state) => {
+  state.spectrogramColumns.length = 0;
+};
 
 export const renderVisualizer = (ctx, mode, frame, settings, dimensions, state) => {
   clearCanvas(ctx, dimensions.width, dimensions.height, settings.transparentBackground);

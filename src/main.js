@@ -1,10 +1,41 @@
 import './styles.css';
 import { AudioAnalyzer } from './audio/analyzer.js';
-import { VISUALIZER_MODES, createVisualizerState, renderVisualizer } from './visualizers/index.js';
+import { VISUALIZER_MODES, createVisualizerState, renderVisualizer, resetVisualizerState } from './visualizers/index.js';
 
 const modeOptions = Object.entries(VISUALIZER_MODES)
   .map(([value, config]) => `<option value="${value}">${config.label}</option>`)
   .join('');
+
+const params = new URLSearchParams(window.location.search);
+const channelName = params.get('channel') || 'bard-visualizer-default';
+const displayMode = params.get('display');
+const startInObsMode = displayMode === 'obs';
+const startInViewerMode = displayMode === 'viewer';
+const relayUrl = `/api/visualizer-state?channel=${encodeURIComponent(channelName)}`;
+
+const createEmptyFrame = () => ({
+  frequencyData: new Uint8Array(128),
+  timeDomainData: new Uint8Array(256),
+  level: 0,
+});
+
+const serializeFrame = (frame) => ({
+  frequencyData: Array.from(frame.frequencyData),
+  timeDomainData: Array.from(frame.timeDomainData),
+  level: frame.level,
+});
+
+const deserializeFrame = (payload) => {
+  if (!payload) {
+    return null;
+  }
+
+  return {
+    frequencyData: Uint8Array.from(payload.frequencyData),
+    timeDomainData: Uint8Array.from(payload.timeDomainData),
+    level: payload.level,
+  };
+};
 
 const app = document.querySelector('#app');
 
@@ -80,6 +111,10 @@ app.innerHTML = `
 
 const analyzer = new AudioAnalyzer();
 const visualizerState = createVisualizerState();
+let mirroredFrame = null;
+let mirroredSettings = null;
+let lastRelayUpdate = 0;
+let relayWriteInFlight = false;
 
 const connectButton = document.querySelector('#connect-button');
 const obsToggleButton = document.querySelector('#obs-toggle-button');
@@ -108,6 +143,52 @@ const settings = {
   transparentBackground: false,
 };
 
+const syncTransparentMode = () => {
+  document.body.classList.toggle('transparent-mode', settings.transparentBackground);
+};
+
+const applySettingsToControls = () => {
+  modeSelect.value = settings.mode;
+  sensitivityRange.value = String(settings.sensitivity);
+  sensitivityValue.textContent = `${settings.sensitivity.toFixed(2)}x`;
+  smoothingRange.value = String(settings.smoothing);
+  smoothingValue.textContent = settings.smoothing.toFixed(2);
+  fftSelect.value = String(settings.fftSize);
+  primaryColorInput.value = settings.primaryColor;
+  accentColorInput.value = settings.accentColor;
+  transparentToggle.checked = settings.transparentBackground;
+  syncTransparentMode();
+};
+
+const publishRelayState = async (frame = null) => {
+  if (startInObsMode || startInViewerMode || relayWriteInFlight) {
+    return;
+  }
+
+  relayWriteInFlight = true;
+
+  try {
+    const response = await fetch(relayUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        settings,
+        frame: frame ? serializeFrame(frame) : null,
+      }),
+    });
+
+    if (response.ok) {
+      lastRelayUpdate = Date.now();
+    }
+  } catch {
+    return;
+  } finally {
+    relayWriteInFlight = false;
+  }
+};
+
 const resizeCanvas = () => {
   const ratio = window.devicePixelRatio || 1;
   const bounds = canvas.getBoundingClientRect();
@@ -128,25 +209,79 @@ const updateOverlay = (frame) => {
 };
 
 const render = () => {
-  const frame = analyzer.getFrame();
+  const liveFrame = analyzer.getFrame();
+  const frame = liveFrame ?? mirroredFrame;
   const width = canvas.clientWidth;
   const height = canvas.clientHeight;
 
   renderVisualizer(
     ctx,
     settings.mode,
-    frame ?? { frequencyData: new Uint8Array(128), timeDomainData: new Uint8Array(256), level: 0 },
+    frame ?? createEmptyFrame(),
     settings,
     { width, height },
     visualizerState,
   );
 
   updateOverlay(frame);
+
+  if (liveFrame) {
+    publishRelayState(liveFrame);
+  }
+
   window.requestAnimationFrame(render);
 };
 
 const updateStatus = (message) => {
   statusText.textContent = message;
+};
+
+const pollMirroredState = async () => {
+  try {
+    const response = await fetch(relayUrl, {
+      cache: 'no-store',
+    });
+
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json();
+
+    if (!payload || payload.updatedAt <= lastRelayUpdate) {
+      return;
+    }
+
+    lastRelayUpdate = payload.updatedAt;
+
+    if (payload.settings) {
+      mirroredSettings = {
+        settings: payload.settings,
+        timestamp: payload.updatedAt,
+      };
+      applyMirroredSettings(payload.settings);
+    }
+
+    if (payload.frame) {
+      mirroredFrame = {
+        ...deserializeFrame(payload.frame),
+        timestamp: payload.updatedAt,
+      };
+    }
+  } catch {
+    return;
+  }
+};
+
+const applyMirroredSettings = (nextSettings) => {
+  settings.mode = nextSettings.mode;
+  settings.sensitivity = nextSettings.sensitivity;
+  settings.smoothing = nextSettings.smoothing;
+  settings.fftSize = nextSettings.fftSize;
+  settings.primaryColor = nextSettings.primaryColor;
+  settings.accentColor = nextSettings.accentColor;
+  settings.transparentBackground = nextSettings.transparentBackground;
+  applySettingsToControls();
 };
 
 const connectAudio = async () => {
@@ -165,11 +300,32 @@ const connectAudio = async () => {
     await analyzer.connectStream(stream);
     analyzer.setSmoothing(settings.smoothing);
     analyzer.setFftSize(settings.fftSize);
+    resetVisualizerState(visualizerState);
+    publishRelayState();
     updateStatus('Audio connected. If prompted, choose the screen/window/tab carrying your target audio output.');
   } catch (error) {
     updateStatus(`Audio connection failed: ${error.message}`);
   }
 };
+
+if (startInObsMode || startInViewerMode) {
+  document.body.classList.add('obs-mode');
+}
+
+if (startInViewerMode) {
+  connectButton.disabled = true;
+  connectButton.textContent = 'Viewer mode';
+  updateStatus(`Viewer mode is polling channel "${channelName}" for live audio-reactive frames.`);
+} else if (startInObsMode) {
+  updateStatus(`OBS mode is polling channel "${channelName}" for mirrored analyzer frames.`);
+}
+
+if (startInObsMode || startInViewerMode) {
+  window.setInterval(pollMirroredState, 60);
+  pollMirroredState();
+}
+
+applySettingsToControls();
 
 connectButton.addEventListener('click', connectAudio);
 obsToggleButton.addEventListener('click', () => {
@@ -177,28 +333,38 @@ obsToggleButton.addEventListener('click', () => {
 });
 modeSelect.addEventListener('change', (event) => {
   settings.mode = event.target.value;
+  resetVisualizerState(visualizerState);
+  publishRelayState();
 });
 sensitivityRange.addEventListener('input', (event) => {
   settings.sensitivity = Number(event.target.value);
   sensitivityValue.textContent = `${settings.sensitivity.toFixed(2)}x`;
+  publishRelayState();
 });
 smoothingRange.addEventListener('input', (event) => {
   settings.smoothing = Number(event.target.value);
   smoothingValue.textContent = settings.smoothing.toFixed(2);
   analyzer.setSmoothing(settings.smoothing);
+  publishRelayState();
 });
 fftSelect.addEventListener('change', (event) => {
   settings.fftSize = Number(event.target.value);
   analyzer.setFftSize(settings.fftSize);
+  resetVisualizerState(visualizerState);
+  publishRelayState();
 });
 primaryColorInput.addEventListener('input', (event) => {
   settings.primaryColor = event.target.value;
+  publishRelayState();
 });
 accentColorInput.addEventListener('input', (event) => {
   settings.accentColor = event.target.value;
+  publishRelayState();
 });
 transparentToggle.addEventListener('change', (event) => {
   settings.transparentBackground = event.target.checked;
+  syncTransparentMode();
+  publishRelayState();
 });
 window.addEventListener('resize', resizeCanvas);
 
